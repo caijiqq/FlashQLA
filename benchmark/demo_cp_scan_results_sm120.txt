@@ -38,10 +38,31 @@ heads segments seed    tile32_us  tile64_us  ws_tma_us   tile32/ws  tile64/ws
    64       16    4      236.564    232.542    194.922       1.21       1.19
    16      127    5      594.046    468.116    428.583       1.39       1.09
 
+Compute Sanitizer validation (2026-10-31, after enabling the WDDM debugger interface):
+- Version: 2025.4.1.0 (build 37093031).
+- All matching experimental-kernel calls were checked: no --launch-count limit.
+- Filter: --kernel-name kns=aggregate_dh_ws_kernel; --error-exitcode 1.
+- Racecheck: heads=4, segments=5, repeats=1; exit 0;
+  RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings).
+- Synccheck: heads=4, segments=5, repeats=1; exit 0;
+  ERROR SUMMARY: 0 errors.
+- Memcheck: heads=16, segments=64, repeats=1; exit 0;
+  ERROR SUMMARY: 0 errors.
+- Each run also completed the 320 numerical/determinism stress repeats above,
+  including packed lengths 1/2/5/17/65, and checked CUDA Graph replay outputs.
+- Maximum relative-max stress errors: racecheck/synccheck 5.149e-03;
+  memcheck 6.152e-03. Default random seed 0 for all three runs.
+- The kernel-name filter excludes the old baseline and PyTorch reference kernels
+  from instrumentation. Sanitizer timing output is not a performance measurement.
+
+Commands:
+compute-sanitizer --tool racecheck --kernel-name kns=aggregate_dh_ws_kernel --error-exitcode 1 .venv/bin/python -m benchmark.demo_cp_scan --heads 4 --segments 5 --repeats 1
+compute-sanitizer --tool synccheck --kernel-name kns=aggregate_dh_ws_kernel --error-exitcode 1 .venv/bin/python -m benchmark.demo_cp_scan --heads 4 --segments 5 --repeats 1
+compute-sanitizer --tool memcheck --kernel-name kns=aggregate_dh_ws_kernel --error-exitcode 1 .venv/bin/python -m benchmark.demo_cp_scan --heads 16 --segments 64 --repeats 1
+
 Limits:
-- Compute Sanitizer remains unvalidated: a previous attempt on this WSL/WDDM
-  setup failed to initialize the debugger interface. It was not rerun in this batch.
-  Repeated numerical checks do not prove absence of races.
+- Sanitizer checks passed for the configurations above; this is not a proof of
+  race freedom or correctness for all possible workloads.
 - Synthetic inputs and one laptop GPU; no multi-GPU or end-to-end claim.
 - VxK layout and other dtypes are outside this prototype.
 - A prior forward-aggregation baseline numerical failure is unresolved and is
@@ -86,3 +107,86 @@ aggregate_dh             us  vs tile32          min..max us  max rel err
 tile32              594.046      1.00x  570.574.. 619.887    7.501e-03
 tile64              468.116      1.27x  446.370.. 494.068    7.501e-03
 ws_tma              428.583      1.39x  407.930.. 458.812    7.501e-03
+
+General multi-rank AutoCP communication prototype (2026-10-31):
+- Replaces the abandoned two-rank, one-sequence send/recv experiment.
+- File: blackwell_sm120/cp_comm.py. Forward all-gathers (h, M), then copies
+  the rank interval needed by backward into a per-forward CPCache.remote_m.
+  The packed h receive buffer is not retained. Backward all-gathers only dh.
+- Intervening ranks contain only the spanning sequence, so first/last M agree.
+  At the end rank, start from its dh directly (fallback[-1] = False), because
+  the received last-sequence M may belong to another sequence. Clone the mask
+  to leave the original context's cached mask unchanged.
+- Cache includes unused endpoint M slots to retain existing scan indexing.
+  With no following rank, cache is an empty tensor (not None); all ranks must
+  still execute the same dh-only collective. No world-size-specific branch.
+- Shared preprocess.py adds one default-off cache_remote_m argument and one
+  cache field. Backward selects the matching protocol from that per-forward
+  cache. SM90/SM100 files and default dispatch are unchanged.
+- demo_dual_cp.py retains baseline / aggregate / comm / both modes. comm enables
+  remote-M reuse; aggregate enables the existing BF16 KxV WS reverse kernel.
+  The default library entry point still uses the original protocol.
+- Uses build_cp_context(enable_inter=True, enable_intra=True, is_train=True),
+  with the real AutoCP decision and no forced partitions. Supports arbitrary
+  valid WORLD_SIZE from torchrun and packed global --seq-lengths.
+
+Single-GPU integration verification:
+- Real forward/backward kernels and real AutoCP; all-gather is mocked.
+  A baseline forward collection pass supplies complete future-rank summaries,
+  then each mode runs forward and reverse-rank backward with those messages.
+  This is not a real multi-process communication or performance test.
+- All four modes, absent/nonzero h0 and dht, compared o/ht/dq/dk/dv/db/dg/dh0.
+  Tested world size / sequence lengths / heads / gate scale:
+    4 / [4096] / 4 / 0.05
+    2 / [4096] / 4 / 0.05
+    3 / [521,11258,509] / 4 / 0.05
+    4 / [521,7162,509] / 4 / 0
+    8 / [521,7162,509] / 4 / 0.05
+    4 / [256,256,256,256,256,256,256,256,6144] / 16 / 0.05
+    4 / [2048,2048,2048,2048] / 16 / 0.05
+- These seven configurations passed with max relative difference 0 from baseline.
+- Two additional configurations passed:
+    4 / [256 x 7, 4608, 256 x 7] / 16 / 0.05
+    4 / [256] / 4 / 0.05
+  The first selects intra=False on both end ranks and intra=True on the two
+  middle ranks of the spanning sequence. The second selects intra=False on
+  every rank. Worst relative difference across all nine configurations was
+  3.205e-03 (aggregate-only, unseeded, first additional case), below 2e-02.
+  comm and both observed relative difference 0 in all nine configurations.
+- The nine-sequence case selected intra=False on rank 0, intra=True on ranks
+  1/2/3 (six partitions each). This exercises mixed per-rank AutoCP decisions.
+- Packed cases exercise distinct first/last sequences on boundary ranks and
+  off-chunk-grid boundaries. The per-card sequence case has no remote dependency.
+- Measured logical backward input bytes/rank:
+    H=4:  baseline/aggregate 393216; comm/both 262144.
+    H=16: baseline/aggregate 1572864; comm/both 1048576.
+  This is 1/3 less backward payload, not an observed NCCL speedup.
+- 64 additional protocol-helper comparisons passed with BF16/FP16 M, KxV/VxK
+  layouts and absent/nonzero seeds. Overwriting the packed receive buffer did
+  not change cached M, and the baseline context's scan masks remained unchanged.
+  These use real correction kernels but mocked all-gather, not real NCCL.
+- Installed pytest in .venv and ran tests/test_cp_context.py: 56 passed.
+  Existing tests/test_cp_e2e.py cases can reuse the demo's mode_hooks through
+  FLASHQLA_CP_OPT=baseline/aggregate/comm/both; no new test cases or pytest matrix.
+- Existing fused_bwd.py buffer-init/vectorization warnings appeared during JIT;
+  baseline and optimized integration checks completed with exit 0.
+
+Reproduce local checks:
+.venv/bin/python -m benchmark.demo_dual_cp --local-check --world-size 4 --heads 4 --seq-lengths 521 7162 509
+.venv/bin/python -m benchmark.demo_dual_cp --local-check --world-size 3 --heads 4 --seq-lengths 521 11258 509
+.venv/bin/python -m benchmark.demo_dual_cp --local-check --world-size 8 --heads 4 --seq-lengths 521 7162 509
+.venv/bin/python -m benchmark.demo_dual_cp --local-check --world-size 4 --heads 16 --seq-lengths 256 256 256 256 256 256 256 256 6144
+
+Real multi-GPU acceptance and timing (not yet run):
+.venv/bin/torchrun --standalone --nproc_per_node=2 -m benchmark.demo_dual_cp --mode all --heads 4 --seq-lengths 521 7162 509
+.venv/bin/torchrun --standalone --nproc_per_node=4 -m benchmark.demo_dual_cp --mode all --heads 4 --seq-lengths 521 7162 509
+- Global token count must be divisible by the actual world size, as required by
+  existing inter CP. --world-size is only for single-GPU emulation.
+- Checks all four modes, then reports fwd+bwd CUDA-event median/min/max using
+  worst-rank time per sample, rotating mode order. --mode selects timing modes.
+- Allocations and host-launch gaps remain inside timing; this is a full step,
+  not an isolated communication-kernel benchmark or communication fraction.
+- NaN/Inf errors fail through one scalar conversion and tolerance assertion;
+  no try/except or automatic fallback was added to the demo or new protocol.
+- Real NCCL correctness, multi-GPU timing and peak-memory impact remain untested.
+  AutoCP integration compares against existing CP, not an independent model oracle.

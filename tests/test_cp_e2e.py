@@ -17,7 +17,15 @@ to each other, so it needs >= 2 GPUs to run at all.
 Debug one config::
 
     pytest tests/test_cp_e2e.py -k "single-ws2 and inter and kv" -s
+
+Reuse these cases with the SM120 demo's optimization switches::
+
+    FLASHQLA_CP_OPT=both pytest tests/test_cp_e2e.py -k "ws2 and inter_intra and kv" -x
+
+FLASHQLA_CP_OPT: baseline (default), aggregate, comm, both. aggregate/both require
+KxV (select ``kv``). Pytest spawns the ranks; do not wrap this command in torchrun.
 """
+from contextlib import nullcontext
 import os
 import socket
 import sys
@@ -187,7 +195,14 @@ def _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group):
 def _cp_worker(rank, world_size, enable_intra, cfg, state_v_first, port):
     try:
         group = _init_distributed(rank, world_size, port)
-        _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group)
+        cp_opt = os.environ.get("FLASHQLA_CP_OPT", "baseline")
+        hooks = nullcontext()
+        if cp_opt != "baseline":
+            # Import after rank/device selection; reuse the demo's exact mode switches.
+            from benchmark.demo_dual_cp import mode_hooks
+            hooks = mode_hooks(cp_opt)
+        with hooks:
+            _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group)
     finally:
         _cleanup_distributed()
 

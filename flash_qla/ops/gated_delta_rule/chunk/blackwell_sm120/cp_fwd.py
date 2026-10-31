@@ -715,63 +715,80 @@ def tilelang_aggregate_dh_ws(H):
     """
     partitions = T.dynamic("partitions")
     sequences = T.dynamic("sequences")
+    DK = DV = 128
+    block_DV = 32
+    num_stages = 2
+    value_tiles = DV // block_DV
+    WS_THREADS = 256           # 128 math + 32 load + 96 parked; no store warp needed
+    CONSUMER_THREADS = 128
+    PRODUCER_THREADS = 32
+    CONSUMER_NREG = 240
+    PRODUCER_NREG = 24
+    BAR_CONSUMER = 3
 
     @T.prim_func
     def aggregate_dh_ws_kernel(
-        seed: T.Tensor([sequences, H, 128, 128], "float32"),
-        dh: T.Tensor([partitions, H, 128, 128], "float32"),
-        mt: T.Tensor([partitions, H, 128, 128], "bfloat16"),
+        seed: T.Tensor([sequences, H, DK, DV], "float32"),
+        dh: T.Tensor([partitions, H, DK, DV], "float32"),
+        mt: T.Tensor([partitions, H, DK, DK], "bfloat16"),
         fallback: T.Tensor([partitions, H], "bool"),
         seq_map: T.Tensor([sequences + 1], "int32"),
-        out: T.Tensor([sequences, H, 128, 128], "float32"),
+        out: T.Tensor([sequences, H, DK, DV], "float32"),
     ):
-        with T.Kernel(sequences * H * 4, threads=256) as (block,):
-            bb, bh, bv = block // (H * 4), block // 4 % H, block % 4
-            lo = bv * 32
+        with T.Kernel(sequences * H * value_tiles, threads=WS_THREADS) as (block,):
+            bb = block // (H * value_tiles)
+            bh, bv = block // value_tiles % H, block % value_tiles
+            lo = bv * block_DV
             count = seq_map[bb + 1] - seq_map[bb]
-            m_stage = T.alloc_shared((2, 128, 128), "bfloat16")
-            dh_shared = T.alloc_shared((128, 32), "float32")
-            prev_shared = T.alloc_shared((128, 32), "bfloat16")
-            state = T.alloc_fragment((128, 32), "float32")
-            ready = T.alloc_barrier(arrive_count=[32, 32])
-            m_free = T.alloc_barrier(arrive_count=[128, 128])
-            dh_free = T.alloc_barrier(arrive_count=128)
+            m_stage = T.alloc_shared((num_stages, DK, DK), "bfloat16")
+            dh_shared = T.alloc_shared((DK, block_DV), "float32")
+            prev_shared = T.alloc_shared((DK, block_DV), "bfloat16")
+            state = T.alloc_fragment((DK, block_DV), "float32")
+            # ready: load -> math, after both M (when needed) and dh arrive.
+            # free: math -> load. Each M slot is reused every two iterations; the
+            # single dh slot advances every iteration. The initial free waits
+            # use the opposite phase so the producer can fill empty slots.
+            ready = T.alloc_barrier(arrive_count=[PRODUCER_THREADS] * num_stages)
+            m_free = T.alloc_barrier(arrive_count=[CONSUMER_THREADS] * num_stages)
+            dh_free = T.alloc_barrier(arrive_count=CONSUMER_THREADS)
             tx = T.get_thread_binding()
 
-            if tx < 128:
-                T.set_max_nreg(240, 1)
-                T.copy(seed[bb, bh, :, lo:lo + 32], state)
+            if tx < CONSUMER_THREADS:
+                T.set_max_nreg(CONSUMER_NREG, 1)
+                T.copy(seed[bb, bh, :, lo:lo + block_DV], state)
                 for i in T.serial(count):
                     idx = seq_map[bb + 1] - 1 - i
+                    stage = i % num_stages
                     if fallback[idx, bh]:
                         T.copy(state, prev_shared)
-                    T.sync_threads(3, 128)
-                    T.barrier_wait(ready[i % 2], (i // 2) % 2)
+                    T.sync_threads(BAR_CONSUMER, CONSUMER_THREADS)
+                    T.barrier_wait(ready[stage], (i // num_stages) % 2)
                     T.copy(dh_shared, state)
                     # All math warps must finish reading before TMA overwrites dh.
-                    T.sync_threads(3, 128)
+                    T.sync_threads(BAR_CONSUMER, CONSUMER_THREADS)
                     T.barrier_arrive(dh_free)
                     if fallback[idx, bh]:
-                        T.gemm(m_stage[i % 2, :, :], prev_shared, state,
+                        T.gemm(m_stage[stage, :, :], prev_shared, state,
                                transpose_A=True, clear_accum=False)
                     # SM120 uses synchronous MMA; all operand reads finish here.
-                    T.sync_threads(3, 128)
-                    T.barrier_arrive(m_free[i % 2])
-                T.copy(state, out[bb, bh, :, lo:lo + 32])
+                    T.sync_threads(BAR_CONSUMER, CONSUMER_THREADS)
+                    T.barrier_arrive(m_free[stage])
+                T.copy(state, out[bb, bh, :, lo:lo + block_DV])
             else:
-                T.set_max_nreg(24, 0)
-                if tx < 160:
+                T.set_max_nreg(PRODUCER_NREG, 0)
+                if tx < CONSUMER_THREADS + PRODUCER_THREADS:
                     for i in T.serial(count):
                         idx = seq_map[bb + 1] - 1 - i
-                        T.barrier_wait(m_free[i % 2], (i // 2 + 1) % 2)
+                        stage = i % num_stages
+                        T.barrier_wait(m_free[stage], (i // num_stages + 1) % 2)
                         if fallback[idx, bh]:
-                            T.tma_copy(mt[idx, bh, :, :], m_stage[i % 2, :, :],
-                                       barrier=ready[i % 2])
+                            T.tma_copy(mt[idx, bh, :, :], m_stage[stage, :, :],
+                                       barrier=ready[stage])
                         # M can start loading while the previous dh is still read.
                         T.barrier_wait(dh_free, (i + 1) % 2)
-                        T.tma_copy(dh[idx, bh, :, lo:lo + 32], dh_shared,
-                                   barrier=ready[i % 2])
-                        T.barrier_arrive(ready[i % 2])
+                        T.tma_copy(dh[idx, bh, :, lo:lo + block_DV], dh_shared,
+                                   barrier=ready[stage])
+                        T.barrier_arrive(ready[stage])
 
     return aggregate_dh_ws_kernel
 

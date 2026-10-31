@@ -17,6 +17,9 @@ class CPCache:
     m_first: torch.Tensor | None = None       # per-seq first-seq M, for the bwd inter gather (is_inter)
     fallback_bwd: torch.Tensor | None = None      # pure-intra bwd fallback mask
     num_warmup_bwd: torch.Tensor | None = None    # pure-intra bwd warmup counts
+    # None selects the original protocol; an empty tensor still selects dh-only
+    # all-gather on ranks without followers, so every rank uses the same collective.
+    remote_m: torch.Tensor | None = None     # opt-in SM120: forward M for the backward rank scan
 
 
 def _assert_inter_intra_supported(is_inter, is_intra, aggregate_card_state):
@@ -103,6 +106,7 @@ def cp_preprocess_fwd(
     initial_state: torch.Tensor | None,
     state_v_first: bool,
     enable_fwd_cp_cache: bool,
+    cache_remote_m: bool = False,
 ):
     from flash_qla.ops.gated_delta_rule.chunk import (
         fused_gdr_h, correct_initial_states, aggregate_card_state,
@@ -116,7 +120,7 @@ def cp_preprocess_fwd(
 
     Hv = v.shape[2]
     chunk_size = a.shape[-1]
-    fallback = num_warmup_bwd = fallback_bwd = None
+    fallback = num_warmup_bwd = fallback_bwd = remote_m = None
 
     # --- Stage 1: prepare_h ---
     if is_intra:
@@ -164,7 +168,12 @@ def cp_preprocess_fwd(
             )
         else:
             h_seq, m_seq = ht, mt
-        card_h0 = _inter_correct_fwd(h_seq, m_seq, initial_state, cp_context, state_v_first)
+        if cache_remote_m:
+            from ..blackwell_sm120.cp_comm import correct_fwd_with_m_cache
+            card_h0, remote_m = correct_fwd_with_m_cache(
+                h_seq, m_seq, initial_state, cp_context, state_v_first)
+        else:
+            card_h0 = _inter_correct_fwd(h_seq, m_seq, initial_state, cp_context, state_v_first)
     else:
         card_h0 = initial_state
 
@@ -186,6 +195,7 @@ def cp_preprocess_fwd(
         m_first=m_seq[0] if is_inter else None,
         fallback_bwd=fallback_bwd,
         num_warmup_bwd=num_warmup_bwd,
+        remote_m=remote_m,
     )
     return cp_h0, cp_cache
 
@@ -298,7 +308,12 @@ def cp_preprocess_bwd(
             )
         else:
             dh_seq = dh
-        card_dht = _inter_correct_bwd(dh_seq, cp_cache.m_first, dht, cp_context, state_v_first)
+        if cp_cache.remote_m is not None:
+            from ..blackwell_sm120.cp_comm import correct_bwd_with_m_cache
+            card_dht = correct_bwd_with_m_cache(
+                dh_seq, cp_cache.remote_m, dht, cp_context, state_v_first)
+        else:
+            card_dht = _inter_correct_bwd(dh_seq, cp_cache.m_first, dht, cp_context, state_v_first)
     else:
         card_dht = dht
 
