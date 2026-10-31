@@ -702,6 +702,80 @@ def tilelang_aggregate_m(
     return tilelang_aggregate_m_kernel
 
 
+@tilelang.jit()
+def tilelang_aggregate_dh_ws(H):
+    """Experimental SM120 reverse aggregation, FP32 dh / BF16 M, KxV layout.
+
+    Adapt the Hopper/SM100 load-warp + math-warpgroup scan. Two M stages
+    (64 KiB), one dh tile (16 KiB), and the previous-state operand (8 KiB)
+    use 88 KiB before barriers. Double-buffering dh as well would use 104
+    KiB, exceeding SM120's 99 KiB/block limit. Release the single dh tile
+    after copying it to registers, so its next load can overlap this GEMM.
+    Kept separate from correction and the production aggregation dispatch.
+    """
+    partitions = T.dynamic("partitions")
+    sequences = T.dynamic("sequences")
+
+    @T.prim_func
+    def aggregate_dh_ws_kernel(
+        seed: T.Tensor([sequences, H, 128, 128], "float32"),
+        dh: T.Tensor([partitions, H, 128, 128], "float32"),
+        mt: T.Tensor([partitions, H, 128, 128], "bfloat16"),
+        fallback: T.Tensor([partitions, H], "bool"),
+        seq_map: T.Tensor([sequences + 1], "int32"),
+        out: T.Tensor([sequences, H, 128, 128], "float32"),
+    ):
+        with T.Kernel(sequences * H * 4, threads=256) as (block,):
+            bb, bh, bv = block // (H * 4), block // 4 % H, block % 4
+            lo = bv * 32
+            count = seq_map[bb + 1] - seq_map[bb]
+            m_stage = T.alloc_shared((2, 128, 128), "bfloat16")
+            dh_shared = T.alloc_shared((128, 32), "float32")
+            prev_shared = T.alloc_shared((128, 32), "bfloat16")
+            state = T.alloc_fragment((128, 32), "float32")
+            ready = T.alloc_barrier(arrive_count=[32, 32])
+            m_free = T.alloc_barrier(arrive_count=[128, 128])
+            dh_free = T.alloc_barrier(arrive_count=128)
+            tx = T.get_thread_binding()
+
+            if tx < 128:
+                T.set_max_nreg(240, 1)
+                T.copy(seed[bb, bh, :, lo:lo + 32], state)
+                for i in T.serial(count):
+                    idx = seq_map[bb + 1] - 1 - i
+                    if fallback[idx, bh]:
+                        T.copy(state, prev_shared)
+                    T.sync_threads(3, 128)
+                    T.barrier_wait(ready[i % 2], (i // 2) % 2)
+                    T.copy(dh_shared, state)
+                    # All math warps must finish reading before TMA overwrites dh.
+                    T.sync_threads(3, 128)
+                    T.barrier_arrive(dh_free)
+                    if fallback[idx, bh]:
+                        T.gemm(m_stage[i % 2, :, :], prev_shared, state,
+                               transpose_A=True, clear_accum=False)
+                    # SM120 uses synchronous MMA; all operand reads finish here.
+                    T.sync_threads(3, 128)
+                    T.barrier_arrive(m_free[i % 2])
+                T.copy(state, out[bb, bh, :, lo:lo + 32])
+            else:
+                T.set_max_nreg(24, 0)
+                if tx < 160:
+                    for i in T.serial(count):
+                        idx = seq_map[bb + 1] - 1 - i
+                        T.barrier_wait(m_free[i % 2], (i // 2 + 1) % 2)
+                        if fallback[idx, bh]:
+                            T.tma_copy(mt[idx, bh, :, :], m_stage[i % 2, :, :],
+                                       barrier=ready[i % 2])
+                        # M can start loading while the previous dh is still read.
+                        T.barrier_wait(dh_free, (i + 1) % 2)
+                        T.tma_copy(dh[idx, bh, :, lo:lo + 32], dh_shared,
+                                   barrier=ready[i % 2])
+                        T.barrier_arrive(ready[i % 2])
+
+    return aggregate_dh_ws_kernel
+
+
 # ---------------------------------------------------------------------------
 # card-level (h, M) aggregation for inter+intra CP
 # ---------------------------------------------------------------------------

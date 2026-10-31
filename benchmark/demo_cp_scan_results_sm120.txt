@@ -1,0 +1,88 @@
+SM120 reverse state aggregation: single-GPU validation
+Date: 2026-10-31
+GPU: NVIDIA GeForce RTX 5070 Ti Laptop GPU
+Branch: feat/multi-gpu-cp-opt
+Scope: experimental tilelang_aggregate_dh_ws; no production dispatch change.
+Inputs: K=V=128, KxV layout, FP32 dh/seed/output, BF16 M, int32 sequence map.
+
+Run from repository root:
+.venv/bin/python -m benchmark.demo_cp_scan --heads H --segments S --seed SEED
+
+Validation:
+- Each configuration tests packed sequence lengths 1, 2, 5, 17, 65.
+- Near-identity and dense nonsymmetric transition matrices.
+- Zero and nonzero initial gradients.
+- All/none/alternating/random fallback masks.
+- 16 combinations x 20 repeats per configuration, 1920 repeats over six runs.
+- Each repeat agrees bit-for-bit with its first output and passes the independent
+  PyTorch recurrence with explicit BF16 operand rounding.
+- Maximum observed relative-max error in the six stress runs: 8.175e-03.
+  Metric: max(abs(actual-reference)) / max(max(abs(reference)), 1e-6).
+  Acceptance threshold: 2e-02.
+- Final four configurations also assert exact dh copying when all history resets.
+- Benchmark workload outputs checked before timing and after CUDA Graph replay.
+
+Timing:
+- Kernels compiled and buffers allocated outside timing.
+- Five warmup graph replays per candidate.
+- 100 kernel calls per graph, nine interleaved measurement rounds.
+- Candidate order rotates and reverses; table reports median microseconds.
+- Timed workload retains all history (all fallback).
+- Ratios below use medians; small differences are sensitive to laptop GPU clocks.
+
+heads segments seed    tile32_us  tile64_us  ws_tma_us   tile32/ws  tile64/ws
+   16       16    0       60.039     50.349     45.346       1.32       1.11
+    8        1    1        3.268      4.917      3.404       0.96       1.44
+    8        4    2        8.470     12.980      7.040       1.20       1.84
+   16       64    3      281.187    232.110    212.606       1.32       1.09
+   64       16    4      236.564    232.542    194.922       1.21       1.19
+   16      127    5      594.046    468.116    428.583       1.39       1.09
+
+Limits:
+- Compute Sanitizer remains unvalidated: a previous attempt on this WSL/WDDM
+  setup failed to initialize the debugger interface. It was not rerun in this batch.
+  Repeated numerical checks do not prove absence of races.
+- Synthetic inputs and one laptop GPU; no multi-GPU or end-to-end claim.
+- VxK layout and other dtypes are outside this prototype.
+- A prior forward-aggregation baseline numerical failure is unresolved and is
+  outside this reverse-aggregation validation.
+- No SM90/SM100 code, communication, correction kernel, or production dispatch
+  was modified by this validation.
+
+Raw output of the final four configurations:
+GPU: NVIDIA GeForce RTX 5070 Ti Laptop GPU; heads=8, segments=4
+K=V=128, KxV layout, BF16 M, FP32 dh; all-fallback timing
+Correctness: all/mixed fallback + nonzero seed; baseline tile=32
+WS stress passed: lengths 1/2/5/17/65, two matrix families, zero/nonzero seeds, four fallback patterns, 320 repeats; max rel err=4.670e-03.
+Correctness passed. Timing preallocated kernels (9 interleaved graph samples).
+aggregate_dh             us  vs tile32          min..max us  max rel err
+tile32                8.470      1.00x    8.362..  10.203    2.029e-03
+tile64               12.980      0.65x   12.890..  14.749    2.029e-03
+ws_tma                7.040      1.20x    6.953..   8.824    2.029e-03
+GPU: NVIDIA GeForce RTX 5070 Ti Laptop GPU; heads=16, segments=64
+K=V=128, KxV layout, BF16 M, FP32 dh; all-fallback timing
+Correctness: all/mixed fallback + nonzero seed; baseline tile=32
+WS stress passed: lengths 1/2/5/17/65, two matrix families, zero/nonzero seeds, four fallback patterns, 320 repeats; max rel err=5.291e-03.
+Correctness passed. Timing preallocated kernels (9 interleaved graph samples).
+aggregate_dh             us  vs tile32          min..max us  max rel err
+tile32              281.187      1.00x  272.663.. 291.277    4.905e-03
+tile64              232.110      1.21x  225.328.. 237.049    4.905e-03
+ws_tma              212.606      1.32x  205.633.. 216.141    4.905e-03
+GPU: NVIDIA GeForce RTX 5070 Ti Laptop GPU; heads=64, segments=16
+K=V=128, KxV layout, BF16 M, FP32 dh; all-fallback timing
+Correctness: all/mixed fallback + nonzero seed; baseline tile=32
+WS stress passed: lengths 1/2/5/17/65, two matrix families, zero/nonzero seeds, four fallback patterns, 320 repeats; max rel err=6.094e-03.
+Correctness passed. Timing preallocated kernels (9 interleaved graph samples).
+aggregate_dh             us  vs tile32          min..max us  max rel err
+tile32              236.564      1.00x  229.887.. 245.167    4.850e-03
+tile64              232.542      1.02x  227.882.. 239.517    4.850e-03
+ws_tma              194.922      1.21x  189.330.. 198.972    4.850e-03
+GPU: NVIDIA GeForce RTX 5070 Ti Laptop GPU; heads=16, segments=127
+K=V=128, KxV layout, BF16 M, FP32 dh; all-fallback timing
+Correctness: all/mixed fallback + nonzero seed; baseline tile=32
+WS stress passed: lengths 1/2/5/17/65, two matrix families, zero/nonzero seeds, four fallback patterns, 320 repeats; max rel err=5.208e-03.
+Correctness passed. Timing preallocated kernels (9 interleaved graph samples).
+aggregate_dh             us  vs tile32          min..max us  max rel err
+tile32              594.046      1.00x  570.574.. 619.887    7.501e-03
+tile64              468.116      1.27x  446.370.. 494.068    7.501e-03
+ws_tma              428.583      1.39x  407.930.. 458.812    7.501e-03
