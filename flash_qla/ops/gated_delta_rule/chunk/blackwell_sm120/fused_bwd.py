@@ -159,7 +159,7 @@ def tilelang_fused_chunk_gdr_bwd(
             # q -> tmp_shared_2_1
             # q_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
             k_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
-            # v_shared was removed: A reads v from global memory, saving 8192 bytes of shared memory.
+            # Consumer A stages V in tmp_shared_2_2 before publishing W.
             a_shared = T.alloc_shared((block_S, block_S), dtype=qkva_dtype)
             # half the dk dim
             h_shared = T.alloc_shared(
@@ -272,6 +272,8 @@ def tilelang_fused_chunk_gdr_bwd(
             bar_dh_right_ready = T.alloc_barrier(arrive_count=128)
             # A-10 write-after-read synchronization for the dg dot product staged through dqkv_shared.
             bar_s4_dot_a = T.alloc_barrier(arrive_count=128)
+            # A-04 publishes V, then finishes all reads before reusing the tile for W.
+            bar_v = T.alloc_barrier(arrive_count=128)
             # dg_shared is updated through scatter stores whose producer
             # threads differ from the following read-modify-write threads.
             # Warpgroup-wide mbarriers keep those phases ordered; a compiler
@@ -966,14 +968,23 @@ def tilelang_fused_chunk_gdr_bwd(
                     # W = V - g * U
                     for j_s, j_v in T.Parallel(block_S, DV):
                         u_fragment[j_s, j_v] *= -g_exp_shared[j_s]
+                    # Coalesce V loads through the existing W tile before MMA-layout reads.
                     for j_s, j_v in T.Parallel(block_S, DV):
                         if seq_start_idx + (num_iters - i_s - 1) * block_S + j_s < seq_end_idx:
-                            u_fragment[j_s, j_v] += v[
+                            tmp_shared_2_2[j_s, j_v] = v[
                                 batch_idx,
                                 seq_start_idx + (num_iters - i_s - 1) * block_S + j_s,
                                 bh,
                                 j_v,
                             ]
+                        else:
+                            tmp_shared_2_2[j_s, j_v] = 0
+                    T.barrier_arrive(bar_v)
+                    T.barrier_wait(bar_v, 0)
+                    for j_s, j_v in T.Parallel(block_S, DV):
+                        u_fragment[j_s, j_v] += tmp_shared_2_2[j_s, j_v]
+                    T.barrier_arrive(bar_v)
+                    T.barrier_wait(bar_v, 1)
                     # S2[2] W
                     T.copy(u_fragment, tmp_shared_2_2)
                     T.barrier_arrive(bar_05)
